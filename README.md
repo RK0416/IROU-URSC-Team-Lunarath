@@ -9,7 +9,7 @@ navigation in commanded and autonomous mode. The requirements for the rover desi
 need to be generated based on the following asks of the navigation task: 
 a) Obstacle identification using sensors: The obstacles given are 150 mm X 150 mm X 
 150 mm and 300 mm X 300 mm X 300 mm. The sensors serve to identify the dimension 
-of the obstacles. 
+of the obstacles. <br/>
 b) Obstacle avoidance/traversal by mobility system: The rover must be capable of 
 traversing over 150 mm X 150 mm X 150 mm obstacles avoiding the 300 mm X 300 
 mm X 300 mm obstacles.
