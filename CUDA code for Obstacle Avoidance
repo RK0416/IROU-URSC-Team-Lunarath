@@ -1,0 +1,245 @@
+import os
+import cv2
+import numpy as np
+import tensorflow as tf
+import pycuda.driver as cuda
+import pycuda.autoinit
+from pycuda.compiler import SourceModule
+import Jetson.GPIO as GPIO
+import time
+import tensorrt as trt
+from queue import Queue
+from threading import Thread
+
+# GPIO setup for navigation control (example GPIO pins, adjust as necessary)
+left_motor_forward = 17
+left_motor_backward = 18
+right_motor_forward = 27
+right_motor_backward = 22
+
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(left_motor_forward, GPIO.OUT)
+GPIO.setup(left_motor_backward, GPIO.OUT)
+GPIO.setup(right_motor_forward, GPIO.OUT)
+GPIO.setup(right_motor_backward, GPIO.OUT)
+
+# Function to control the rover
+def move_forward():
+    GPIO.output(left_motor_forward, GPIO.HIGH)
+    GPIO.output(left_motor_backward, GPIO.LOW)
+    GPIO.output(right_motor_forward, GPIO.HIGH)
+    GPIO.output(right_motor_backward, GPIO.LOW)
+
+def move_backward():
+    GPIO.output(left_motor_forward, GPIO.LOW)
+    GPIO.output(left_motor_backward, GPIO.HIGH)
+    GPIO.output(right_motor_forward, GPIO.LOW)
+    GPIO.output(right_motor_backward, GPIO.HIGH)
+
+def move_left():
+    GPIO.output(left_motor_forward, GPIO.LOW)
+    GPIO.output(left_motor_backward, GPIO.HIGH)
+    GPIO.output(right_motor_forward, GPIO.HIGH)
+    GPIO.output(right_motor_backward, GPIO.LOW)
+
+def move_right():
+    GPIO.output(left_motor_forward, GPIO.HIGH)
+    GPIO.output(left_motor_backward, GPIO.LOW)
+    GPIO.output(right_motor_forward, GPIO.LOW)
+    GPIO.output(right_motor_backward, GPIO.HIGH)
+
+def stop():
+    GPIO.output(left_motor_forward, GPIO.LOW)
+    GPIO.output(left_motor_backward, GPIO.LOW)
+    GPIO.output(right_motor_forward, GPIO.LOW)
+    GPIO.output(right_motor_backward, GPIO.LOW)
+
+# Function to compute depth from disparity using CUDA
+mod = SourceModule("""
+_global_ void process_depth(float *disparity, float *depth, float focal_length, float baseline) {
+    int idx = threadIdx.x + blockDim.x * blockIdx.x;
+    if (disparity[idx] != 0) {
+        depth[idx] = (focal_length * baseline) / disparity[idx];
+    } else {
+        depth[idx] = 0;
+    }
+}
+""")
+
+process_depth = mod.get_function("process_depth")
+
+def compute_depth_cuda(disparity, focal_length, baseline):
+    disparity_gpu = cuda.mem_alloc(disparity.nbytes)
+    depth_gpu = cuda.mem_alloc(disparity.nbytes)
+    cuda.memcpy_htod(disparity_gpu, disparity)
+    process_depth(disparity_gpu, depth_gpu, np.float32(focal_length), np.float32(baseline), block=(512, 1, 1), grid=(disparity.size // 512, 1))
+    depth = np.empty_like(disparity)
+    cuda.memcpy_dtoh(depth, depth_gpu)
+    return depth
+
+# Load the TensorRT-optimized object detection model
+TRT_LOGGER = trt.Logger(trt.Logger.WARNING)
+
+def build_engine(model_file):
+    with trt.Builder(TRT_LOGGER) as builder, builder.create_network(1) as network, trt.OnnxParser(network, TRT_LOGGER) as parser:
+        builder.max_workspace_size = 1 << 20  # 1GB
+        builder.max_batch_size = 1
+        with open(model_file, 'rb') as model:
+            parser.parse(model.read())
+        return builder.build_cuda_engine(network)
+
+engine = build_engine('ssd_mobilenet_v2_coco.trt')
+
+def allocate_buffers(engine):
+    h_input = cuda.pagelocked_empty(trt.volume(engine.get_binding_shape(0)), dtype=np.float32)
+    h_output = cuda.pagelocked_empty(trt.volume(engine.get_binding_shape(1)), dtype=np.float32)
+    d_input = cuda.mem_alloc(h_input.nbytes)
+    d_output = cuda.mem_alloc(h_output.nbytes)
+    stream = cuda.Stream()
+    return h_input, h_output, d_input, d_output, stream
+
+h_input, h_output, d_input, d_output, stream = allocate_buffers(engine)
+context = engine.create_execution_context()
+
+def detect_objects(frame, context, h_input, h_output, d_input, d_output, stream):
+    frame_resized = cv2.resize(frame, (300, 300))
+    np.copyto(h_input, frame_resized.ravel())
+    cuda.memcpy_htod_async(d_input, h_input, stream)
+    context.execute_async(batch_size=1, bindings=[int(d_input), int(d_output)], stream_handle=stream.handle)
+    cuda.memcpy_dtoh_async(h_output, d_output, stream)
+    stream.synchronize()
+    return h_output
+
+# Stereo camera setup
+cap_left = cv2.VideoCapture(0)  # Left camera
+cap_right = cv2.VideoCapture(1)  # Right camera
+
+# Define the stereo matcher with CUDA support
+def stereo_matching_cuda(left_img, right_img):
+    left_gpu = cuda.mem_alloc(left_img.nbytes)
+    right_gpu = cuda.mem_alloc(right_img.nbytes)
+    disp_gpu = cuda.mem_alloc(left_img.nbytes)
+    
+    cuda.memcpy_htod(left_gpu, left_img)
+    cuda.memcpy_htod(right_gpu, right_img)
+    
+    # Implement your CUDA stereo matching algorithm here
+    # For example, using VisionWorks or custom CUDA kernels
+    
+    disparity = np.empty_like(left_img)
+    cuda.memcpy_dtoh(disparity, disp_gpu)
+    return disparity
+
+# Function to handle stereo matching in a separate thread
+def stereo_thread(left_queue, right_queue, disparity_queue):
+    while True:
+        left_img = left_queue.get()
+        right_img = right_queue.get()
+        disparity = stereo_matching_cuda(left_img, right_img)
+        disparity_queue.put(disparity)
+
+# Function to handle object detection in a separate thread
+def detection_thread(frame_queue, detection_queue):
+    while True:
+        frame = frame_queue.get()
+        detections = detect_objects(frame, context, h_input, h_output, d_input, d_output, stream)
+        detection_queue.put(detections)
+
+# Main obstacle avoidance function
+def obstacle_avoidance():
+    focal_length = 700  # Example focal length in pixels
+    baseline = 0.2  # Baseline distance in meters (20 cm)
+
+    # Queues for thread communication
+    left_queue = Queue()
+    right_queue = Queue()
+    disparity_queue = Queue()
+    frame_queue = Queue()
+    detection_queue = Queue()
+
+    # Start threads
+    Thread(target=stereo_thread, args=(left_queue, right_queue, disparity_queue)).start()
+    Thread(target=detection_thread, args=(frame_queue, detection_queue)).start()
+
+    while True:
+        ret_left, frame_left = cap_left.read()
+        ret_right, frame_right = cap_right.read()
+        if not ret_left or not ret_right:
+            break
+
+        # Convert to grayscale
+        gray_left = cv2.cvtColor(frame_left, cv2.COLOR_BGR2GRAY)
+        gray_right = cv2.cvtColor(frame_right, cv2.COLOR_BGR2GRAY)
+
+        # Apply Gaussian blur
+        blurred_left = cv2.GaussianBlur(gray_left, (5, 5), 0)
+        blurred_right = cv2.GaussianBlur(gray_right, (5, 5), 0)
+
+        # Apply Sobel filter for edge detection
+        sobel_left = cv2.Sobel(blurred_left, cv2.CV_64F, 1, 0, ksize=5)
+        sobel_right = cv2.Sobel(blurred_right, cv2.CV_64F, 1, 0, ksize=5)
+
+        # Add frames to queues
+        left_queue.put(sobel_left)
+        right_queue.put(sobel_right)
+        frame_queue.put(frame_left)
+
+        # Get disparity and detections from queues
+        disparity = disparity_queue.get()
+        detections = detection_queue.get()
+
+        # Compute depth map using CUDA
+        depth_map = compute_depth_cuda(disparity, focal_length, baseline)
+
+        # Process detections
+        for detection in detections:
+            score = detection[2]
+            if score > 0.5:
+                xmin, ymin, xmax, ymax = detection[3:7]
+                left, top, right, bottom = int(xmin * frame_left.shape[1]), int(ymin * frame_left.shape[0]), int(xmax * frame_left.shape[1]), int(ymax * frame_left.shape[0])
+                
+                # Draw bounding box
+                cv2.rectangle(frame_left, (left, top), (right, bottom), (0, 255, 0), 2)
+
+                # Estimate object size
+                object_width = right - left
+                object_height = bottom - top
+                object_size = max(object_width, object_height)
+
+                # Calculate depth of the detected object
+                object_depth = np.mean(depth_map[top:bottom, left:right])
+
+                # Display size and depth
+                label = f'Size: {object_size:.2f} cm, Depth: {object_depth:.2f} m'
+                cv2.putText(frame_left, label, (left, top - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
+                # Navigation logic
+                if object_depth < 1.0:
+                    if left < frame_left.shape[1] / 2:
+                        cv2.putText(frame_left, 'Move RIGHT', (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
+                        move_right()
+                    else:
+                        cv2.putText(frame_left, 'Move LEFT', (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
+                        move_left()
+                elif object_size < 15:
+                    cv2.putText(frame_left, 'Move FORWARD', (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+                    move_forward()
+                else:
+                    cv2.putText(frame_left, 'STOP', (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
+                    stop()
+
+        # Display the result
+        cv2.imshow('Stereo Vision and Object Detection', frame_left)
+
+        if cv2.waitKey(1) & 0xFF== ord('q'):
+            break
+
+    # Clean up
+    cap_left.release()
+    cap_right.release()
+    cv2.destroyAllWindows()
+    GPIO.cleanup()
+
+# Run the obstacle avoidance function
+if name == "main":
+    obstacle_avoidance()
